@@ -1,0 +1,6 @@
+edu_fineweb10B/
+log/
+*.pt
+*.npy
+__pycache__/
+.venv/
