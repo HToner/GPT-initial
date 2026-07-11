@@ -183,7 +183,7 @@ class DataLoaderLite:
         assert split in {'train', 'val'}
 
         # get the shard filenames
-        data_root = "edu_fineweb10B"
+        data_root = os.path.join(os.path.dirname(__file__), "edu_fineweb10B")
         shards = os.listdir(data_root) #shards is now the name of each file in the folder
         shards = [s for s in shards if split in s] #filters train or val
         shards = sorted(shards)
@@ -238,7 +238,7 @@ if torch.cuda.is_available():
 enc = tiktoken.get_encoding("gpt2")
 
 total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
-B = 64 # micro batch size
+B = 4 # micro batch size
 T = 1024 # sequence length
 assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
@@ -315,7 +315,7 @@ for step in range(max_steps):
                 # optionally write model checkpoints
                 checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
                 checkpoint = {
-                    'optimizer' : optimizer.state_dict, #momentum, lr, betas, weight decay, etc
+                    'optimizer' : optimizer.state_dict(), #momentum, lr, betas, weight decay, etc
                     'model': model.state_dict(),
                     'config': model.config,
                     'step': step,
@@ -330,7 +330,7 @@ for step in range(max_steps):
         model.eval()
         num_return_sequences = 4
         max_length = 32
-        tokens = enc.encode("Hello, I'm a language model,")
+        tokens = enc.encode("The best thing about living alone")
         tokens = torch.tensor(tokens, dtype=torch.long)
         tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) #adds dimension in B w each extra sequence
         xgen = tokens.to(device)
