@@ -11,8 +11,28 @@ import numpy as np
 import pandas as pd
 import copy
 import subprocess
+
 #from hellaswag import render_example, iterate_examples
 # -----------------------------------------------------------------------------
+
+
+@dataclass #decorator that creates init, so we don't have to write it 
+class GPTConfig:
+    batch_size: int = 4
+    total_batch_size: int = 100
+    max_tokens: int = 10000000
+    max_lr: float = 6e-6
+    min_lr_ratio: float = 0.5
+    warmup_tokens: int = 1000000
+    block_size: int = 256 # max sequence length
+    vocab_size: int = 50257 # number of tokens: 50,000 BPE merges + 256 bytes tokens + 1 <|endoftext|> token
+    #messy number--need to increase to pwr 2
+    n_layer: int = 3 # number of layers
+    n_head: int = 4 # number of heads
+    n_embd: int = 256 # embedding dimension
+    seed: int = 1337
+    max_time_seconds: float = 360000
+    validation_time_delta: int = 18000
 @dataclass
 class TrainResults:
     config: GPTConfig
@@ -24,22 +44,6 @@ class TrainResults:
     stopped_due_to_time: bool
     elapsed_seconds: float
 
-@dataclass #decorator that creates init, so we don't have to write it 
-class GPTConfig:
-    batch_size: int = 4
-    total_batch_size: int = 100
-    max_steps: int = 10000
-    max_lr: float = 6e-6
-    min_lr_ratio: float = 0.5
-    warmup_steps: int = 50
-    block_size: int = 256 # max sequence length
-    vocab_size: int = 50257 # number of tokens: 50,000 BPE merges + 256 bytes tokens + 1 <|endoftext|> token
-    #messy number--need to increase to pwr 2
-    n_layer: int = 3 # number of layers
-    n_head: int = 4 # number of heads
-    n_embd: int = 256 # embedding dimension
-    seed: int = 1337
-    max_time_seconds: float | None = None
 
 def train_gpt(config:GPTConfig,run_name:str):
     run_dir = os.path.join("runs",run_name)
@@ -48,7 +52,7 @@ def train_gpt(config:GPTConfig,run_name:str):
 
     train_logs = []
     val_logs = []
-
+    print(f"beginning process {run_name}")
 
 
     total_batch_size = config.total_batch_size       #524288 # 2**19, ~0.5M, in number of tokens 
@@ -56,8 +60,10 @@ def train_gpt(config:GPTConfig,run_name:str):
     T = config.block_size #1024 # sequence length
     max_lr = config.max_lr  #6e-4
     min_lr = max_lr * config.min_lr_ratio
-    warmup_steps = config.warmup_steps #715
-    max_steps = config.max_steps # 19073 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
+    warmup_tokens = config.warmup_tokens
+    warmup_steps = warmup_tokens // total_batch_size
+
+    max_steps = config.max_tokens // total_batch_size # 19073 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
 
     testing_prompt = "the best thing about living alone"
     class CausalSelfAttention(nn.Module):
@@ -196,9 +202,6 @@ def train_gpt(config:GPTConfig,run_name:str):
             ]
             num_decay_params = sum(p.numel() for p in decay_params)
             num_nodecay_params = sum(p.numel() for p in nodecay_params)
-            if master_process:
-                print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-                print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
             # Create AdamW optimizer and use the fused version if it is available
             fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
             use_fused = fused_available and device_type == "cuda"
@@ -294,7 +297,7 @@ def train_gpt(config:GPTConfig,run_name:str):
     model = GPT(config) #GPTconfig with default params, pass that into GPT!
     # model = GPT.from_pretrained("gpt2") # or init from OpenAI GPT-2
     model.to(device)
-    use_compile = False # torch.compile interferes with HellaSwag eval and Generation. TODO fix
+    use_compile = True # torch.compile interferes with HellaSwag eval and Generation. TODO fix
     if use_compile:
         model = torch.compile(model)
 
@@ -354,47 +357,69 @@ def train_gpt(config:GPTConfig,run_name:str):
     best_val_loss = float("inf")
     best_val_step = None
     best_model_state = None
+
+    def run_validation(step, training_elapsed_seconds, current_non_training_time):
+        nonlocal best_val_loss, best_val_step, best_model_state
+
+        validation_start = time.monotonic()
+        model.eval()
+        val_loader.reset()
+        with torch.no_grad():
+            val_loss_accum = 0.0
+            val_loss_steps = 20
+            for _ in range(val_loss_steps):
+                x, y = val_loader.next_batch()
+                x, y = x.to(device), y.to(device)
+                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                    logits, loss = model(x, y)
+                loss = loss / val_loss_steps
+                val_loss_accum += loss.detach()
+            val_loss = val_loss_accum.item()
+            if best_val_loss > val_loss:
+                best_val_loss = val_loss
+                best_val_step = step
+                best_model_state = copy.deepcopy(model.state_dict())
+                checkpoint = {
+                    "step":step,"model_state_dict":model.state_dict(),"val_loss":best_val_loss,"config":config
+                }
+                torch.save(checkpoint,best_model_path)
+
+        val_gpu_stats = get_gpu_stats(device)
+        validation_time = time.monotonic() - validation_start
+        val_logs.append({
+            "step":step,
+            "val_loss":val_loss,
+            "val_perplexity":math.exp(val_loss),
+            "elapsed_seconds":training_elapsed_seconds,
+            "wall_elapsed_seconds":time.monotonic() - train_start_time,
+            "non_training_time_this_step":validation_time,
+            "total_non_training_time":current_non_training_time + validation_time,
+            **val_gpu_stats
+        })
+        return validation_time
+
     train_start_time = time.monotonic()
     stopped_due_to_time = False
+    next_val_time = config.validation_time_delta
+    total_non_training_time = 0.0
+    last_completed_step = None
+    last_val_step = None
     for step in range(max_steps):
         elapsed_seconds = time.monotonic() - train_start_time
-        if config.max_time_seconds is not None and elapsed_seconds >= config.max_time_seconds:
+        training_elapsed_seconds = elapsed_seconds - total_non_training_time
+        if training_elapsed_seconds >= config.max_time_seconds:
             stopped_due_to_time = True
-            if master_process:
-                print(f"time budget reached before step {step}; stopping training")
             break
-
-        t0 = time.monotonic()
-        last_step = (step == max_steps - 1)
-
+        should_validate = training_elapsed_seconds >= next_val_time
         # once in a while evaluate our validation loss
-        if step % 250 == 0 or last_step:
-            model.eval()
-            val_loader.reset()
-            with torch.no_grad():
-                val_loss_accum = 0.0
-                val_loss_steps = 20
-                for _ in range(val_loss_steps):
-                    x, y = val_loader.next_batch()
-                    x, y = x.to(device), y.to(device)
-                    with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                        logits, loss = model(x, y)
-                    loss = loss / val_loss_steps
-                    val_loss_accum += loss.detach()
-                val_loss = val_loss_accum.item()
-                if best_val_loss > val_loss:
-                    best_val_loss = val_loss
-                    best_val_step = step
-                    best_model_state = copy.deepcopy(model.state_dict())
-                    checkpoint = {
-                        "step":step,"model_state_dict":model.state_dict(),"val_loss":best_val_loss,"config":config
-                    }
-                    torch.save(checkpoint,best_model_path)
-            val_logs.append({
-                "step":step,"val_loss":val_loss_accum.item(),"val_perplexity":math.exp(val_loss_accum),**get_gpu_stats(device)
-            })
-
+        if should_validate:
+            validation_time = run_validation(step, training_elapsed_seconds, total_non_training_time)
+            while next_val_time <= training_elapsed_seconds:
+                next_val_time += config.validation_time_delta
+            total_non_training_time += validation_time
+            last_val_step = step
         # do one step of the optimization
+        t0 = time.monotonic()
         model.train()
         optimizer.zero_grad()
         loss_accum = 0.0
@@ -421,17 +446,24 @@ def train_gpt(config:GPTConfig,run_name:str):
         optimizer.step()
         if device_type == "cuda":
             torch.cuda.synchronize() # wait for the GPU to finish work
-        t1 = time.time()
+        t1 = time.monotonic()
         dt = t1 - t0 # time difference in seconds
         tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
         tokens_per_sec = tokens_processed / dt
+        last_completed_step = step
+        logging_start = time.monotonic()
+        wall_elapsed_seconds = time.monotonic() - train_start_time
+        training_elapsed_seconds = wall_elapsed_seconds - total_non_training_time
         train_logs.append({
             "step":step,
             "train_loss":loss_accum.item(),
             "lr":lr,
             "grad_norm":norm.item(),
             "tps":tokens_per_sec,
-            "elapsed_seconds":time.monotonic() - train_start_time,
+            "elapsed_seconds":training_elapsed_seconds,
+            "wall_elapsed_seconds":wall_elapsed_seconds,
+            "non_training_time_this_step":0.0,
+            "total_non_training_time":total_non_training_time,
             **get_gpu_stats(device)
         })
         train_df = pd.DataFrame(train_logs)
@@ -439,15 +471,30 @@ def train_gpt(config:GPTConfig,run_name:str):
 
         train_df.to_csv(os.path.join(run_dir, "train_logs.csv"), index=False)
         val_df.to_csv(os.path.join(run_dir, "val_logs.csv"), index=False)
+        logging_time = time.monotonic() - logging_start
+        total_non_training_time += logging_time
+        train_logs[-1]["non_training_time_this_step"] = logging_time
+        train_logs[-1]["total_non_training_time"] = total_non_training_time
+        train_df = pd.DataFrame(train_logs)
+        train_df.to_csv(os.path.join(run_dir, "train_logs.csv"), index=False)
+    if last_completed_step is not None and last_val_step != last_completed_step:
+        wall_elapsed_seconds = time.monotonic() - train_start_time
+        training_elapsed_seconds = wall_elapsed_seconds - total_non_training_time
+        validation_time = run_validation(last_completed_step, training_elapsed_seconds, total_non_training_time)
+        total_non_training_time += validation_time
+        final_logging_start = time.monotonic()
+        val_df = pd.DataFrame(val_logs)
+        val_df.to_csv(os.path.join(run_dir, "val_logs.csv"), index=False)
+        total_non_training_time += time.monotonic() - final_logging_start
     return TrainResults(
-        config=GPTConfig,
+        config=config,
         train_logs=train_logs,
         val_logs=val_logs,
         best_val_loss=best_val_loss,
         best_val_step=best_val_step,
         best_model_path=best_model_path,
         stopped_due_to_time=stopped_due_to_time,
-        elapsed_seconds=time.monotonic() - train_start_time)
+        elapsed_seconds=time.monotonic() - train_start_time - total_non_training_time)
 
 
 
@@ -470,8 +517,25 @@ class GPTConfig:
     n_embd: int = 256 # embedding dimension
     seed: int = 1337
     max_time_seconds: float | None = None
+    valdation_time_delta: float
 
 """
-tests = {"layers":GPTConfig(n_layer=3),"heads,layers":GPTConfig(n_layer=3,n_head=2)}
+tests = {"layers1":GPTConfig(n_layer=1),"layers2":GPTConfig(n_layer=2),"layers3":GPTConfig(n_layer=3),"layers4":GPTConfig(n_layer=4),"layers5":GPTConfig(n_layer=5),"layers6":GPTConfig(n_layer=6),"layers7":GPTConfig(n_layer=7),"layers8":GPTConfig(n_layer=8)}
 for key in tests:
     train_gpt(tests[key],key)
+
+
+"""
+n_layer 2,4,8
+n_head 2,4,8
+n_embd 128,256,384
+"""
+compile_tests = {"comp1":GPTConfig(n_layer=2,n_head=2,n_embd=128), #LLL
+                 "comp2":GPTConfig(n_layer=2,n_head=4,n_embd=256), #LMM
+                 "comp3":GPTConfig(n_layer=2,n_head=8,n_embd=384), #LHH
+                 "comp4":GPTConfig(n_layer=4,n_head=2,n_embd=256), #MLM
+                 "comp5":GPTConfig(n_layer=4,n_head=4,n_embd=384), #MMH
+                 "comp6":GPTConfig(n_layer=4,n_head=8,n_embd=384), #MHH
+                 "comp7":GPTConfig(n_layer=8,n_head=4,n_embd=128), #HML
+                 "comp8":GPTConfig(n_layer=8,n_head=8,n_embd=256), #HHM
+                 "comp1":GPTConfig(n_layer=8,n_head=2,n_embd=384)} #HLH
